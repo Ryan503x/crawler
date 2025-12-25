@@ -3,5 +3,5 @@ Python Crawler extract parameters to identify query and input feilds and use reg
 
 
 # Use Case
-
+```bash
 python paracrawler.py -u https://example.com -o output.csv
