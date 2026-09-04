@@ -8,7 +8,11 @@ import threading
 import time
 import warnings
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ThreadPoolExecutor,
+    wait,
+)
 from optparse import OptionParser
 from urllib.parse import parse_qsl, unquote, urljoin, urlparse
 
@@ -21,6 +25,24 @@ from scrapy.linkextractors import LinkExtractor
 from urllib3.exceptions import InsecureRequestWarning
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+# Prefer lxml for HTML parsing: it is several times faster than the pure-Python
+# html.parser and lets a large crawl finish noticeably sooner. Fall back
+# gracefully if lxml is not installed so the crawler keeps working everywhere.
+try:
+    import lxml  # noqa: F401  (import probe only)
+    _HTML_PARSER = 'lxml'
+except ImportError:
+    _HTML_PARSER = 'html.parser'
+
+
+def make_soup(html):
+    """Build a BeautifulSoup tree using the fastest available parser."""
+    try:
+        return BeautifulSoup(html, _HTML_PARSER)
+    except Exception:
+        # A broken/missing lxml at runtime should never abort a crawl.
+        return BeautifulSoup(html, 'html.parser')
 
 # Import DNS resolver with fallback
 try:
@@ -57,8 +79,58 @@ init(autoreset=True)
 # Disable SSL warnings
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
-# Use the bundled Public Suffix List snapshot; never make a network request here.
-TLD_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=())
+# Public-suffix handling. tldextract is preferred, but it is only usable when
+# its Public Suffix List data is available locally: some distro packages ship
+# tldextract without the bundled ".tld_set_snapshot" file, and with
+# suffix_list_urls=() (no network) extraction then raises FileNotFoundError.
+# We probe it once at import; if it can't work offline we fall back to a
+# compact built-in heuristic so scope matching keeps working without network.
+try:
+    TLD_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=())
+    TLD_EXTRACTOR('example.com')  # force snapshot load now, so failures surface here
+    _TLDEXTRACT_OK = True
+except Exception:
+    TLD_EXTRACTOR = None
+    _TLDEXTRACT_OK = False
+
+# Second-level labels that act as public suffixes under a 2-letter ccTLD
+# (e.g. gov.sa, co.uk, com.au). Used only by the offline fallback below.
+_CCTLD_SECOND_LEVELS = frozenset({
+    'co', 'com', 'net', 'org', 'gov', 'edu', 'ac', 'mil', 'sch', 'gob',
+    'gouv', 'go', 'or', 'ne', 'gr', 'ad', 'ed', 'lg', 're', 'id', 'asn',
+    'gen', 'firm', 'ind', 'res', 'med', 'pub', 'nom', 'name', 'biz', 'info',
+    'mod', 'nhs', 'plc', 'ltd', 'me', 'in',
+})
+
+
+def _fallback_registered_domain(host):
+    """Best-effort eTLD+1 without a Public Suffix List (offline heuristic)."""
+    labels = host.split('.')
+    if len(labels) <= 2:
+        return host
+    tld, sld = labels[-1], labels[-2]
+    if len(tld) == 2 and sld in _CCTLD_SECOND_LEVELS:
+        return '.'.join(labels[-3:])
+    return '.'.join(labels[-2:])
+
+
+def registered_domain(host):
+    """Return the registrable domain (eTLD+1) for a host. Offline-safe.
+
+    Falls back to a built-in heuristic when tldextract's PSL data is missing,
+    so the crawler never crashes on domain parsing.
+    """
+    host = (host or '').lower().strip().rstrip('.')
+    if not host or '.' not in host:
+        return host
+    if _TLDEXTRACT_OK:
+        try:
+            reg = TLD_EXTRACTOR(host).top_domain_under_public_suffix
+            if reg:
+                return reg
+        except Exception:
+            pass
+    return _fallback_registered_domain(host)
 
 
 def print_color_legend():
@@ -235,6 +307,7 @@ class AdvancedCrawler:
         max_response_bytes=1048576,
         request_retries=1,
         https_fallback=True,
+        extra_headers=None,
     ):
         self.visited = set()
         self.to_visit = deque()
@@ -258,8 +331,22 @@ class AdvancedCrawler:
         self.found_files = set()
         self.crawl_subdomains = crawl_subdomains
         self.debug = debug
-        
+        # Authenticated-session headers (Cookie, Authorization, custom headers).
+        # Applied to every thread-local session so all requests share the auth.
+        self.extra_headers = dict(extra_headers) if extra_headers else {}
+
         self._thread_local = threading.local()
+        # Cooperative cancellation flag. Set on Ctrl+C (or when a URL limit is
+        # reached) so in-flight workers stop scheduling new work and the crawl
+        # unwinds promptly instead of blocking on every queued request.
+        self._stop = threading.Event()
+        # A single LinkExtractor is reusable and thread-safe for extract_links;
+        # constructing a new one per page was needless per-request overhead.
+        self._link_extractor = LinkExtractor()
+
+    def stop(self):
+        """Request cooperative shutdown of all crawl activity."""
+        self._stop.set()
 
     def _create_session(self):
         """Create a configured HTTP session for one worker thread."""
@@ -270,6 +357,10 @@ class AdvancedCrawler:
             'Accept-Language': 'en-US,en;q=0.5',
             'Connection': 'keep-alive',
         })
+        # Apply authenticated-session headers last so a supplied Cookie /
+        # Authorization / User-Agent overrides the defaults above.
+        if self.extra_headers:
+            session.headers.update(self.extra_headers)
         session.verify = False
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=self.max_workers,
@@ -321,17 +412,14 @@ class AdvancedCrawler:
                     and (target_host.startswith('www.') or base_host.startswith('www.'))
                 )
 
-            base_parts = TLD_EXTRACTOR(base_host)
-            target_parts = TLD_EXTRACTOR(target_host)
-            if base_parts.suffix and target_parts.suffix:
-                return (
-                    base_parts.top_domain_under_public_suffix
-                    == target_parts.top_domain_under_public_suffix
-                )
+            base_reg = registered_domain(base_host)
+            target_reg = registered_domain(target_host)
+            if base_reg and target_reg:
+                return base_reg == target_reg
 
             # For private/internal names with no known public suffix, only permit
             # the exact host and its descendants; never guess sibling scope.
-            return target_host.endswith(f'.{base_host}')
+            return target_host == base_host or target_host.endswith(f'.{base_host}')
         except (TypeError, ValueError, AttributeError) as error:
             if self.debug:
                 print(f"[DEBUG] Domain check error for {target_url}: {error}")
@@ -451,9 +539,15 @@ class AdvancedCrawler:
             return None
 
         for attempt in range(retries):
+            if self._stop.is_set():
+                return None
             response = None
             try:
-                time.sleep(random.uniform(*self.delay_range))
+                # Skip the politeness delay entirely when shutting down so an
+                # interrupt is not held up by sleeping worker threads.
+                low, high = self.delay_range
+                if high > 0 and not self._stop.is_set():
+                    time.sleep(random.uniform(low, high))
 
                 response, final_url, redirect_allowed = self._request_with_safe_redirects(url, timeout)
 
@@ -524,25 +618,25 @@ class AdvancedCrawler:
         return None
 
     def debug_extract_links(self, html, base_url):
-        """Debug method to see what links are being found"""
-        soup = BeautifulSoup(html, 'html.parser')
-        
+        """Debug method to see what links are being found.
+
+        The extra BeautifulSoup pass here is purely diagnostic, so it only runs
+        under --debug. In normal runs we skip straight to the fast extractor and
+        avoid parsing every page an extra time.
+        """
         if self.debug:
             print(f"\n[DEBUG] Analyzing links from: {base_url}")
-        
-        # Check all a tags
-        a_tags = soup.find_all('a', href=True)
-        if self.debug:
+            soup = make_soup(html)
+
+            # Check all a tags
+            a_tags = soup.find_all('a', href=True)
             print(f"[DEBUG] Found {len(a_tags)} <a> tags with href")
-        
-        if self.debug:
             for i, tag in enumerate(a_tags[:10]):  # Show first 10
                 href = tag.get('href', '').strip()
                 print(f"  [LINK {i}] {href}")
-        
-        # Check all link tags
-        link_tags = soup.find_all('link', href=True)
-        if self.debug:
+
+            # Check all link tags
+            link_tags = soup.find_all('link', href=True)
             print(f"[DEBUG] Found {len(link_tags)} <link> tags with href")
             for i, tag in enumerate(link_tags[:10]):  # Show first 10
                 href = tag.get('href', '').strip()
@@ -550,14 +644,13 @@ class AdvancedCrawler:
                 if isinstance(rel, list):
                     rel = ' '.join(rel)
                 print(f"  [LINK TAG {i}] {href} (rel: {rel})")
-        
+
         return self.extract_links(html, base_url)
 
     def extract_links(self, html, base_url):
         """Extract all links from HTML content using Scrapy's LinkExtractor"""
-        extractor = LinkExtractor()
         response = TextResponse(url=base_url, body=html, encoding='utf-8')
-        return [link.url for link in extractor.extract_links(response)]
+        return [link.url for link in self._link_extractor.extract_links(response)]
 
     def discover_subdomains_from_html(self, html, base_url):
         """Discover subdomains from HTML content - FIXED FOR BETTER DETECTION"""
@@ -633,6 +726,9 @@ class AdvancedCrawler:
 
     def crawl_worker(self, url):
         """Worker function for crawling URLs - FIXED FOR SUBDOMAIN RECURSION"""
+        # Bail immediately if a shutdown was requested (Ctrl+C / limit reached).
+        if self._stop.is_set():
+            return None, []
         # SECURITY CHECK: Verify URL is from the same domain before processing
         if not self.is_same_domain(url):
             return None, []
@@ -717,10 +813,7 @@ class AdvancedCrawler:
         start_url = self.normalize_url(start_url)
         parsed = urlparse(start_url)
         self.base_domain = (parsed.hostname or '').lower()
-        extracted_domain = TLD_EXTRACTOR(self.base_domain)
-        self.root_domain = (
-            extracted_domain.top_domain_under_public_suffix or self.base_domain
-        )
+        self.root_domain = registered_domain(self.base_domain) or self.base_domain
         
         # SECURITY CHECK: Validate the base domain
         if not self.base_domain or '.' not in self.base_domain:
@@ -745,40 +838,50 @@ class AdvancedCrawler:
         print(f"[INFO] Root domain: {self.root_domain}")
         print("-"*50)
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            while self.to_visit and (max_urls is None or len(self.visited) < max_urls):
-                # Debug: Show queue status
+        # Rolling-submission scheduler.
+        #
+        # The previous design submitted a fixed batch and then blocked until
+        # *every* URL in it finished before queuing the next batch. A single
+        # slow/timeout URL stalled the whole batch, wasting worker capacity and
+        # making the run feel like it "hung". Here we keep the pool continuously
+        # saturated: as soon as any worker finishes we harvest its result and
+        # top the pool back up. We also drive the executor manually so an
+        # interrupt (or a URL-limit hit) tears everything down immediately via
+        # cancel_futures instead of the context manager's blocking join.
+        executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        in_flight = {}          # Future -> url
+        dispatched = 0          # total URLs handed to workers (bounds max_urls)
+        # A little headroom over max_workers keeps threads fed while results are
+        # being consumed, without letting the pending queue grow unbounded.
+        max_in_flight = self.max_workers * 2
+        try:
+            while not self._stop.is_set():
+                # Top up the pool from the frontier queue.
+                while (
+                    self.to_visit
+                    and len(in_flight) < max_in_flight
+                    and (max_urls is None or dispatched < max_urls)
+                ):
+                    url = self.to_visit.popleft()
+                    if url in self.visited:
+                        continue
+                    in_flight[executor.submit(self.crawl_worker, url)] = url
+                    dispatched += 1
+
+                if not in_flight:
+                    break  # Nothing running and nothing queued: crawl is done.
+
                 if self.debug:
-                    print(f"[DEBUG] URLs in queue: {len(self.to_visit)}, Visited: {len(self.visited)}, Crawled: {self.crawled_count}")
+                    print(f"[DEBUG] In-flight: {len(in_flight)}, Queue: {len(self.to_visit)}, "
+                          f"Visited: {len(self.visited)}, Crawled: {self.crawled_count}")
 
-                # Count submitted/visited work, not only successful responses, so
-                # failures and non-HTML resources consume the strict URL limit.
-                batch_capacity = self.max_workers * 2
-                if max_urls is not None:
-                    batch_capacity = min(batch_capacity, max_urls - len(self.visited))
-                batch_capacity = min(batch_capacity, len(self.to_visit))
-
-                batch_urls = []
-                for _ in range(max(0, batch_capacity)):
-                    try:
-                        url = self.to_visit.popleft()
-                        if url not in self.visited:
-                            batch_urls.append(url)
-                    except IndexError:
-                        break
-                
-                # Sort batch for consistent processing order
-                batch_urls.sort()
-                
-                if not batch_urls:
-                    break
-                
-                
-                # Submit all URLs in batch
-                futures = [executor.submit(self.crawl_worker, url) for url in batch_urls]
-
-                # Consume completed work immediately instead of blocking on submission order.
-                for future in as_completed(futures):
+                # Wait with a short timeout so the loop stays responsive to a
+                # stop request even while requests are still outstanding.
+                done, _pending = wait(
+                    in_flight, timeout=0.5, return_when=FIRST_COMPLETED
+                )
+                for future in done:
+                    in_flight.pop(future, None)
                     try:
                         url, _new_links = future.result()
                         if url:
@@ -786,22 +889,35 @@ class AdvancedCrawler:
                     except Exception as error:
                         if self.debug:
                             print(f"[DEBUG] Worker error: {error}")
-        
-        # Visit found files to get their status codes
-        self.visit_found_files()
+        except BaseException:
+            # Ctrl+C (KeyboardInterrupt) or the generator being closed lands
+            # here: flag shutdown so running workers stop doing extra work.
+            self._stop.set()
+            raise
+        finally:
+            # Never block on shutdown: cancel anything queued and let the few
+            # already-running requests unwind on their own bounded timeouts.
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        # Visit found files to get their status codes (skipped if interrupted).
+        if not self._stop.is_set():
+            self.visit_found_files()
 
     def visit_found_files(self):
         """Visit found files to get their actual status codes"""
-        if not self.found_files:
+        if not self.found_files or self._stop.is_set():
             return
-        
-        with ThreadPoolExecutor(max_workers=min(5, self.max_workers)) as executor:
+
+        executor = ThreadPoolExecutor(max_workers=min(5, self.max_workers))
+        try:
             # Submit all found files for status checking
             futures = []
             for file_url in self.found_files:
+                if self._stop.is_set():
+                    break
                 future = executor.submit(self.check_file_status, file_url)
                 futures.append((file_url, future))
-            
+
             # Process results as they complete
             for file_url, future in futures:
                 try:
@@ -812,6 +928,11 @@ class AdvancedCrawler:
                 except Exception:
                     with self.lock:
                         self.url_status[file_url] = "ERROR"
+        except BaseException:
+            self._stop.set()
+            raise
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def check_file_status(self, url):
         """Check a file status without following redirects outside scope."""
@@ -990,7 +1111,7 @@ class Endpoint:
     def _extract_forms_buttons_hidden_fallback(self):
         """Extract form elements from stored HTML - IMPROVED"""
         try:
-            soup = BeautifulSoup(self.html_content, 'html.parser')
+            soup = make_soup(self.html_content)
             forms = soup.find_all('form')
             # Reset all collections
             self.html_inputs = []
@@ -1252,6 +1373,17 @@ def main():
                      default=True, help="Do not try HTTPS when an HTTP request fails")
     parser.add_option("--max-size", dest="max_size", type="float", default=1.0,
                      help="Maximum HTML response size in MiB (default: 1)")
+    parser.add_option("-c", "--cookie", dest="cookie", default=None, metavar="COOKIE",
+                     help="Cookie header for an authenticated session, "
+                          "e.g. -c 'sessionid=abc; csrftoken=xyz'")
+    parser.add_option("-A", "--auth", "--authorization", dest="authorization", default=None,
+                     metavar="AUTH",
+                     help="Authorization header value, e.g. -A 'Bearer eyJ...' "
+                          "or -A 'Basic dXNlcjpwYXNz'")
+    parser.add_option("-H", "--header", dest="headers", action="append", default=[],
+                     metavar="HEADER",
+                     help="Extra request header as 'Name: Value' (repeatable), "
+                          "e.g. -H 'X-Api-Key: 123'")
     (options, _args) = parser.parse_args()
 
     if not math.isfinite(options.delay) or options.delay < 0:
@@ -1279,6 +1411,21 @@ def main():
     request_retries = options.retries
     max_response_bytes = max(1024, int(options.max_size * 1024 * 1024))
 
+    # Build authenticated-session headers from --cookie / --auth / --header
+    extra_headers = {}
+    if options.cookie:
+        extra_headers['Cookie'] = options.cookie
+    if options.authorization:
+        extra_headers['Authorization'] = options.authorization
+    for raw in options.headers:
+        if ':' not in raw:
+            parser.error(f"invalid --header '{raw}'. Use 'Name: Value' format.")
+        name, value = raw.split(':', 1)
+        name, value = name.strip(), value.strip()
+        if not name:
+            parser.error(f"invalid --header '{raw}'. Header name is empty.")
+        extra_headers[name] = value
+
     # Validate required parameters
     if not base_url:
         print(Fore.RED + "Error: Base URL is required. Use -u or --url option.")
@@ -1301,10 +1448,17 @@ def main():
             max_response_bytes=max_response_bytes,
             request_retries=request_retries,
             https_fallback=options.https_fallback,
+            extra_headers=extra_headers or None,
         )
+        if extra_headers:
+            print(Fore.CYAN + f"[INFO] Authenticated session: sending {', '.join(sorted(extra_headers))} header(s)" + Style.RESET_ALL)
         
-        # First pass: crawl all URLs
-        for url in crawler.run_crawler(base_url, max_urls):
+        # First pass: crawl all URLs.
+        # A Ctrl+C here stops the crawl promptly but still falls through to the
+        # summary and CSV/JSON output so partial results are never lost.
+        crawl_generator = crawler.run_crawler(base_url, max_urls)
+        try:
+          for url in crawl_generator:
             status = crawler.url_status.get(url)
             # Skip 404 and other error status codes, only process successful ones
             if status and status >= 400:
@@ -1363,7 +1517,13 @@ def main():
                     print(url_display + " : " + " ".join(query_parts))
                 else:
                     print(url_display)
-        
+        except KeyboardInterrupt:
+            # Stop the crawler cooperatively, then continue to reporting/output
+            # below with whatever was collected so far.
+            print("\n[!] Interrupt received - stopping crawl, writing results collected so far...")
+            crawler.stop()
+            crawl_generator.close()
+
         total_crawled = crawler.crawled_count
         
         # Summary output
